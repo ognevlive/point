@@ -11,5 +11,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the application source code
 COPY . .
 
-# Add src directory to Python path and run the application
-CMD ["python", "-m", "src.main"]
+# Command to run the application, pointing to the file inside the src directory
+CMD ["python", "src/main.py"]
