@@ -10,19 +10,22 @@ OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 
 # --- System Prompt ---
 SYSTEM_PROMPT = """
-You are a local historian and a talented storyteller.
-You will be given a JSON object with data about a specific location, including the current address and a list of nearby points of interest from Wikipedia.
-Your task is to weave this information into a compelling and informative story about the location for a Telegram bot user.
+You are a local historian and a talented storyteller with deep knowledge of urban history and local culture.
+You will be given data about a specific location including the address and nearby places from OpenStreetMap.
+Your task is to create an engaging story about this location, including both historical facts and interesting local details.
 
 Your response MUST follow these rules:
-1.  **Language:** Write in the language specified in the `language` field of the JSON data.
-2.  **Format:** Use Telegram's MarkdownV2 formatting. Use headings, bold text, and italics to make the text engaging.
+1.  **Language:** Write in the language specified in the `language` field (Russian for 'ru', English for 'en').
+2.  **Format:** Use Telegram's MarkdownV2 formatting with headings, bold text, and italics.
 3.  **Content:**
-    - Start with a brief historical overview of the area based on the provided data.
-    - Describe 3-5 of the most interesting nearby buildings or objects from the list. For each, mention its name and a brief history or fact.
-    - Do NOT invent information. Base your story only on the data provided.
-    - The entire response should be concise, around 5-10 sentences in total.
+    - Start with a brief overview of the area and its character.
+    - Describe 3-5 nearby places, including both important landmarks and interesting local spots.
+    - For each place, mention its name and add interesting context or historical details.
+    - Include local color, cultural references, and interesting facts about the area.
+    - You can mention things like: local businesses, architectural details, community spaces, historical events, or cultural significance.
+    - The response should be 8-15 sentences total, engaging and informative.
 4.  **Tone:** Be engaging, informative, and slightly informal, as if talking to a curious friend.
+5.  **Creativity:** You can add interesting local details and cultural context, but base the core information on the provided data.
 """
 
 # --- OpenAI Client ---
@@ -35,9 +38,9 @@ else:
         base_url=OPENAI_BASE_URL,
     )
 
-async def get_story_from_llm(address: str, places_data: list, lang: str = "en"):
+async def get_story_from_llm(address: str, places_data: list, address_details: dict = None, lang: str = "en"):
     """
-    Generates a historical story using an LLM.
+    Generates a historical story using an LLM based on location data.
     """
     if not client:
         logging.error("OpenAI client not initialized. Check OPENAI_API_KEY.")
@@ -47,6 +50,7 @@ async def get_story_from_llm(address: str, places_data: list, lang: str = "en"):
     prompt_data = {
         "language": lang,
         "current_address": address,
+        "address_details": address_details or {},
         "nearby_places": places_data,
     }
 
@@ -58,8 +62,8 @@ async def get_story_from_llm(address: str, places_data: list, lang: str = "en"):
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": f"Here is the raw data JSON: {json.dumps(prompt_data, ensure_ascii=False)}"}
             ],
-            temperature=0.7,
-            max_tokens=2048, # As per spec, 2k context
+            temperature=0.8,
+            max_tokens=2048,
         )
         return response.choices[0].message.content
     except OpenAIError as e:

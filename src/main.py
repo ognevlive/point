@@ -9,10 +9,11 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
-from src.wiki import find_nearby_places, get_page_summary
-from src.llm import get_story_from_llm
+from .places import get_place_info, get_address_details
+from .llm import get_story_from_llm
 
 load_dotenv()
 
@@ -34,9 +35,23 @@ def escape_markdown(text: str) -> str:
     """Escapes characters for Telegram's MarkdownV2 format."""
     if not isinstance(text, str):
         return ""
-    # Note: The hyphen must be at the end of the character class to be treated literally.
+    # Escape all special characters for MarkdownV2
     escape_chars = r"[_*\[\]()~`>#+=|{}.!-]"
     return re.sub(f"({escape_chars})", r"\\\1", text)
+
+async def safe_send_message(message: Message, text: str):
+    """Safely sends a message with proper markdown escaping."""
+    try:
+        # First try to send as-is
+        return await message.answer(text)
+    except Exception as e:
+        if "can't parse entities" in str(e):
+            # If markdown parsing fails, escape the text and try again
+            escaped_text = escape_markdown(text)
+            return await message.answer(escaped_text)
+        else:
+            # If other error, just send plain text
+            return await message.answer(text.replace("*", "").replace("_", "").replace("`", ""))
 
 
 # --- Geocoding Service ---
@@ -65,14 +80,31 @@ async def get_address_from_coords(latitude: float, longitude: float, lang: str =
 
 
 # --- Message Handlers ---
+@dp.message()
+async def debug_handler(message: Message):
+    """
+    Debug handler to see what messages are received.
+    """
+    logging.info(f"DEBUG: Received message type: {type(message)}")
+    logging.info(f"DEBUG: Message content: {message}")
+    if hasattr(message, 'location') and message.location:
+        logging.info(f"DEBUG: Location found: {message.location}")
+        # Call the location handler
+        await location_handler(message)
+    elif hasattr(message, 'text') and message.text:
+        logging.info(f"DEBUG: Text message: {message.text}")
+        if message.text == "/start":
+            await command_start_handler(message)
+
+
 @dp.message(CommandStart())
 async def command_start_handler(message: Message) -> None:
     """
     Handles the /start command and shows the location button.
     """
     await message.answer(
-        f"Здравствуйте, {message.from_user.full_name}!\n\n"
-        "Нажмите кнопку ниже, чтобы поделиться вашим местоположением и получить историческую справку.",
+        f"Здравствуйте, {escape_markdown(message.from_user.full_name)}\!\n\n"
+        "Нажмите кнопку ниже, чтобы поделиться вашим местоположением и получить историческую справку\\.",
         reply_markup=location_keyboard,
     )
 
@@ -82,62 +114,81 @@ async def location_handler(message: Message):
     """
     Handles receiving a location, gets data, and generates a story.
     """
+    logging.info(f"Received location from user {message.from_user.id}: {message.location}")
+    
     lat, lon = message.location.latitude, message.location.longitude
     user_lang = message.from_user.language_code or "en"
+    
+    logging.info(f"Processing location: lat={lat}, lon={lon}, lang={user_lang}")
 
     await message.answer(
-        "Получил координаты. Собираю исторические данные...",
+        "Получил координаты\\. Собираю исторические данные\\.\\.\\.",
         reply_markup=location_keyboard,
     )
 
-    # 1. Get Address
+    # 1. Get Address and Details
+    logging.info("Getting address from coordinates...")
     address = await get_address_from_coords(lat, lon, user_lang)
     if not address:
-        await message.answer("Не удалось определить ваш адрес. Попробуйте еще раз.")
+        logging.error("Failed to get address from coordinates")
+        await message.answer("Не удалось определить ваш адрес\\. Попробуйте еще раз\\.")
+        return
+    
+    logging.info(f"Found address: {address}")
+    
+    # Get detailed address information
+    address_details = await get_address_details(lat, lon, user_lang)
+
+    # 2. Find nearby places from OpenStreetMap
+    logging.info("Searching for nearby places...")
+    places = await get_place_info(lat, lon, SEARCH_RADIUS_M)
+    if not places:
+        logging.info(f"No places found in {SEARCH_RADIUS_M}m, expanding to 500m.")
+        places = await get_place_info(lat, lon, 500)
+    if not places:
+        logging.info("No places found in 500m, expanding to 1000m.")
+        places = await get_place_info(lat, lon, 1000)
+
+    if not places:
+        logging.warning("No places found in vicinity")
+        await message.answer("К сожалению, не нашел ничего интересного в окрестностях\\.")
         return
 
-    # 2. Find nearby places from Wikipedia
-    places = await find_nearby_places(lat, lon, SEARCH_RADIUS_M, user_lang)
-    if not places:
-        logging.info(f"No places found in {SEARCH_RADIUS_M}m, expanding to 300m.")
-        places = await find_nearby_places(lat, lon, 300, user_lang)
+    logging.info(f"Found {len(places)} places")
 
-    if not places:
-        await message.answer("К сожалению, не нашел ничего интересного в окрестностях.")
-        return
-
-    # 3. Get summaries for found places
+    # 3. Prepare places data for LLM
     places_data = []
     for place in places:
-        summary = await get_page_summary(place.get("pageid"), user_lang)
-        if summary:
-            places_data.append({"title": place.get("title"), "summary": summary})
+        places_data.append({
+            "title": place.get("name", "Неизвестное место"),
+            "type": place.get("type", "place"),
+            "description": place.get("description", "Интересное место"),
+            "tags": place.get("tags", {})
+        })
 
-    if not places_data:
-        await message.answer("Нашел несколько объектов, но не смог получить для них описание.")
-        return
+    logging.info(f"Prepared data for {len(places_data)} places")
 
     # 4. Generate story with LLM
-    await message.answer("Все данные собраны. Отправляю запрос краеведу-нейросети...")
-    story = await get_story_from_llm(address, places_data, user_lang)
+    await message.answer("Все данные собраны\\. Отправляю запрос краеведу\\-нейросети\\.\\.\\.")
+    story = await get_story_from_llm(address, places_data, address_details, user_lang)
 
     # 5. Send response (LLM story or fallback)
     if story:
-        await message.answer(story)
+        await safe_send_message(message, story)
     else:
         # Fallback to simple list if LLM fails
-        await message.answer("Не удалось сгенерировать историю. Вот краткая справка:")
+        await message.answer("Не удалось сгенерировать историю\\. Вот краткая справка:")
         response_parts = ["📜 *Что я нашел поблизости:*"]
         for place in places_data:
             response_parts.append(
-                f"\n🏛️ *{escape_markdown(place['title'])}*\n{escape_markdown(place['summary'])}"
+                f"\n🏛️ *{escape_markdown(place['title'])}*\n{escape_markdown(place['description'])}"
             )
         await message.answer("\n".join(response_parts))
 
 
 # --- Main Application Logic ---
 async def main() -> None:
-    bot = Bot(TOKEN, parse_mode=ParseMode.MARKDOWN_V2)
+    bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN_V2))
     await dp.start_polling(bot)
 
 
