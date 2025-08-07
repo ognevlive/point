@@ -10,18 +10,15 @@ from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from dotenv import load_dotenv
-from aiogram.client.default import DefaultBotProperties
 
-from .osm import get_historic_places_from_overpass
-from .wiki import search_place_by_name, get_page_summary
-from .llm import filter_interesting_places, extract_facts_from_text, get_story_from_llm
+from src.gis2 import get_places_from_2gis
+from src.llm import enrich_place_with_llm, get_story_from_llm
 
 load_dotenv()
 
 # --- Environment Variables ---
 TOKEN = os.getenv("BOT_TOKEN")
-OSM_ENDPOINT = os.getenv("OSM_ENDPOINT", "https://nominatim.openstreetmap.org")
-SEARCH_RADIUS_M = int(os.getenv("SEARCH_RADIUS_M", 300))  # Increased default radius
+SEARCH_RADIUS_M = int(os.getenv("SEARCH_RADIUS_M", 500)) # Increased default radius
 
 # --- Bot Setup ---
 dp = Dispatcher()
@@ -41,31 +38,6 @@ def escape_markdown(text: str) -> str:
     return re.sub(f"({escape_chars})", r"\\\1", text)
 
 
-# --- Geocoding Service ---
-async def get_address_from_coords(latitude: float, longitude: float, lang: str = "en"):
-    """
-    Reverse geocode coordinates to get an address using Nominatim.
-    """
-    headers = {"User-Agent": "TelegramBot/1.0"}
-    url = f"{OSM_ENDPOINT}/reverse"
-    params = {
-        "lat": latitude,
-        "lon": longitude,
-        "format": "json",
-        "accept-language": f"{lang},en",  # Fallback to english
-        "zoom": 18,
-    }
-    async with aiohttp.ClientSession(headers=headers) as session:
-        try:
-            async with session.get(url, params=params) as response:
-                response.raise_for_status()
-                data = await response.json()
-                return data.get("display_name")
-        except aiohttp.ClientError as e:
-            logging.error(f"Error fetching address from Nominatim: {e}")
-            return None
-
-
 # --- Message Handlers ---
 @dp.message(CommandStart())
 async def command_start_handler(message: Message) -> None:
@@ -73,8 +45,8 @@ async def command_start_handler(message: Message) -> None:
     Handles the /start command and shows the location button.
     """
     await message.answer(
-        escape_markdown(f"Здравствуйте, {message.from_user.full_name}!\n\n"
-        "Нажмите кнопку ниже, чтобы поделиться вашим местоположением и получить историческую справку."),
+        f"Здравствуйте, {message.from_user.full_name}!\n\n"
+        "Нажмите кнопку ниже, чтобы поделиться вашим местоположением и получить историческую справку.",
         reply_markup=location_keyboard,
     )
 
@@ -82,7 +54,7 @@ async def command_start_handler(message: Message) -> None:
 @dp.message(F.location)
 async def location_handler(message: Message):
     """
-    Handles the new multi-step data processing pipeline.
+    Handles the new 2GIS + LLM data processing pipeline.
     """
     lat, lon = message.location.latitude, message.location.longitude
     user_lang = message.from_user.language_code or "en"
@@ -90,56 +62,43 @@ async def location_handler(message: Message):
     # F-5: Log request with rounded coordinates
     logging.info(f"New request from user {message.from_user.id}. Location: ({lat:.3f}, {lon:.3f})")
 
-    # 1. Get Address
-    await message.answer(escape_markdown("Получил координаты. Ищу ваш адрес..."), reply_markup=location_keyboard)
-    address = await get_address_from_coords(lat, lon, user_lang)
-    if not address:
-        await message.answer(escape_markdown("Не удалось определить ваш адрес. Попробуйте еще раз."))
+    # 1. Get places from 2GIS
+    await message.answer("Получил координаты. Ищу интересные места поблизости через 2ГИС...", reply_markup=location_keyboard)
+    places = await get_places_from_2gis(lat, lon, SEARCH_RADIUS_M)
+    if not places:
+        await message.answer("К сожалению, не нашел ничего интересного в окрестностях по данным 2ГИС.")
         return
 
-    # 2. Get raw list of places from OpenStreetMap
-    await message.answer(escape_markdown("Нашел ваш адрес. Ищу поблизости исторические объекты в OpenStreetMap..."))
-    raw_places = await get_historic_places_from_overpass(lat, lon, SEARCH_RADIUS_M)
-    if not raw_places:
-        await message.answer(escape_markdown("К сожалению, не нашел ничего интересного в окрестностях по данным OSM."))
+    # 2. Enrich places with LLM
+    await message.answer(f"Нашел {len(places)} потенциально интересных мест. Обогащаю данные с помощью нейросети-историка...")
+
+    enrichment_tasks = [enrich_place_with_llm(place, user_lang) for place in places]
+    enriched_places_results = await asyncio.gather(*enrichment_tasks)
+
+    # Filter out places that couldn't be enriched with historical context
+    final_places = [p for p in enriched_places_results if p and p.get("historical_context")]
+
+    if not final_places:
+        await message.answer("Не удалось найти достаточно исторической информации об этих местах.")
         return
 
-    # 3. Filter places with LLM
-    await message.answer(escape_markdown(f"Нашел {len(raw_places)} объектов. Отправляю гиду-нейросети для фильтрации самого интересного..."))
-    interesting_places = await filter_interesting_places(raw_places, user_lang)
-    if not interesting_places:
-        await message.answer(escape_markdown("После фильтрации нейросетью не осталось интересных мест. Попробуйте другое местоположение."))
-        return
+    # 3. Generate final story
+    # For the address, we can use the address of the first found object or call Nominatim. Let's use the first object.
+    address = final_places[0].get("address_name", "Ваше местоположение")
+    await message.answer("Все данные собраны. Отправляю нейросети-рассказчику для написания истории...")
+    story = await get_story_from_llm(address, final_places, user_lang)
 
-    # 4. Enrich data and extract facts
-    await message.answer(escape_markdown(f"Отобрал {len(interesting_places)} мест. Ищу информацию о них в Wikipedia и извлекаю факты..."))
-    structured_facts = []
-    for place in interesting_places:
-        place_name = place.get("name")
-        page_id = await search_place_by_name(place_name, user_lang)
-        if page_id:
-            summary = await get_page_summary(page_id, user_lang)
-            if summary:
-                facts = await extract_facts_from_text(summary, place_name, user_lang)
-                if facts:
-                    structured_facts.append({"name": place_name, **facts})
-
-    if not structured_facts:
-        await message.answer(escape_markdown("Не удалось найти достаточно фактов об этих местах для создания истории."))
-        return
-
-    # 5. Generate final story
-    await message.answer(escape_markdown("Все факты собраны. Отправляю историю-нейросети для написания рассказа..."))
-    story = await get_story_from_llm(address, structured_facts, user_lang)
     if story:
-        await message.answer(escape_markdown(story))
+        await message.answer(story)
     else:
-        await message.answer(escape_markdown("К сожалению, не удалось создать историю. Попробуйте еще раз позже."))
+        await message.answer("К сожалению, не удалось создать историю. Попробуйте еще раз позже.")
 
 
 # --- Main Application Logic ---
 async def main() -> None:
-    bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN_V2))
+    # Initialize Bot instance with a default parse mode which will be passed to all API calls
+    bot = Bot(TOKEN, parse_mode=ParseMode.MARKDOWN_V2)
+    # And the run events dispatching
     await dp.start_polling(bot)
 
 
